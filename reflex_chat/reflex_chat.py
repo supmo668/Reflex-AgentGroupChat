@@ -3,21 +3,24 @@
 import reflex as rx
 import reflex_chakra as rc
 
-from reflex_chat.components import agent_chat
+from reflex_chat.components import chat, chat_list
 from reflex_chat.states.chat_state import ChatState
 
+@rx.page(on_load=ChatState.check_and_open_modal)
 def index() -> rx.Component:
     """The main app."""
     return rx.vstack(
-        rx.heading("AutoGen Chat", margin="1em"),
-        agent_chat.chat(),
-        agent_chat.action_bar(),
+        chat_list.chat_list(),
+        chat.chat(),
+        chat.action_bar(),
+        # Include the modal that will be controlled by show_modal state
+        # We're using the unpacked form to avoid passing None to dialog.trigger
+        chat_list.modal(),
         background_color=rx.color("mauve", 1),
         color=rx.color("mauve", 12),
         min_height="100vh",
         align_items="stretch",
         spacing="0",
-        on_mount=ChatState.start_chat,
     )
 
 

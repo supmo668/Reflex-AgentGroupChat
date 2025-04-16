@@ -1,8 +1,9 @@
 import os
 import json
 import logging
-from typing import Any, Optional, Callable, Awaitable
+from typing import Any, Optional, Callable, Awaitable, Dict, List, Literal
 import asyncio
+from uuid import uuid4
 
 import reflex as rx
 import yaml
@@ -13,9 +14,10 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import TextMessage, UserInputRequestedEvent
 from autogen_agentchat.conditions import ExternalTermination
-
 from autogen_core import CancellationToken
 from autogen_core.models import ChatCompletionClient
+
+from reflex_chat.utils import token_manager
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -26,62 +28,286 @@ MODEL_CONFIG_PATH = "model_config.yaml"
 STATE_PATH = "team_state.json"
 HISTORY_PATH = "team_history.json"
 
-class QA(rx.Base):
-    """A question and answer pair."""
-    content: str
+class Message(rx.Base):
+    """Message model for chat interactions."""
     source: str
+    models_usage: Optional[dict] = None
+    metadata: dict = {}
+    content: str
+    type: Literal["TextMessage"] = "TextMessage"
+
+
+# Message class is now the primary message representation
+
+
+class ChatSession(rx.Base):
+    """A chat session with a unique ID and messages."""
+    id: str
+    name: str
+    messages: list[Message] = []
+    is_initialized: bool = False
+    is_processing: bool = False
+    submitted_message: Optional[str] = None
+    team_state: Dict[str, Any] = {}
+    
+    @property
+    def is_user_turn(self) -> bool:
+        """Check if it's the user's turn to send a message."""
+        # It's the user's turn if the session is not processing a message
+        # and the session is not initialized (first message)
+        return not self.is_processing and not self.is_initialized
 
 
 class ChatState(rx.State):
     """The chat state."""
     
-    # The list of messages in the current chat
-    messages: list[QA] = []
+    # Chat sessions
+    chat_sessions: Dict[str, ChatSession] = {}
+    current_chat_id: str = ""
+    show_modal: bool = False
+    new_chat_name: str = ""
     
-    # Whether we are processing a message
-    processing: bool = False
-    chat_ongoing: bool = False
-    # The current message being typed
-    current_message: str = ""
-    submitted_message: Optional[str] = None
-    
-    # The team state as a dictionary
-    team_state: dict = {}
+    # Current message being typed
+    user_message: str = ""
+        
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Create initial session if needed
+        if not self.chat_sessions:
+            initial_session = ChatSession(id=str(uuid4()), name="New Chat")
+            self.chat_sessions = {initial_session.id: initial_session}
+            self.current_chat_id = initial_session.id
 
+    @rx.var
+    def has_messages(self) -> bool:
+        """Check if there are messages in the current session."""
+        return self.has_current_session and len(self.current_session.messages) > 0
+    
+    @rx.var
+    def can_send_message(self) -> bool:
+        """Check if a message can be sent.
+        # Can send if:
+        # 1. There's a non-empty message
+        # 2. It's the user's turn (not processing and either not initialized or input requested)
+        """
+        is_user_turn = self.current_session.is_user_turn if self.current_session else False
+        return self.has_messages and is_user_turn
+        
+    @rx.var
+    def input_placeholder(self) -> str:
+        """Get the appropriate placeholder text for the input field."""
+        if not self.current_session:
+            return "Type something..."
+            
+        # Show different placeholder based on whether the chat is initialized
+        if not self.current_session.is_initialized:
+            return "Kick-off with the topic of interest"
+        else:
+            return "Message to group..."
+    
+    @rx.var
+    def submit_button_text(self) -> str:
+        """Get the appropriate text for the submit button."""
+        if not self.current_session:
+            return "Start Chat"
+            
+        # Show different button text based on whether the chat is initialized
+        if not self.current_session.is_initialized:
+            return "Submit Topic & Start Chat"
+        else:
+            return "Send"
+            
+    @rx.var
+    def submit_button_color(self) -> str:
+        """Get the appropriate color for the submit button."""
+        if not self.current_session or not self.current_session.is_initialized:
+            return "green"
+        else:
+            return "violet"
+    
+    @rx.var
+    def session_list(self) -> List[ChatSession]:
+        """Get the list of chat sessions."""
+        return list(self.chat_sessions.values())
+    
+    @rx.var
+    def current_session(self) -> Optional[ChatSession]:
+        """Get the current chat session."""
+        return self.chat_sessions.get(self.current_chat_id)
+    
+    @rx.var
+    def messages(self) -> List[Message]:
+        """Get the messages in the current session."""
+        return self.current_session.messages if self.current_session else []
+    
+    @rx.event
+    def set_user_message(self, message: str):
+        """Set the current message.
+        
+        Args:
+            message: The message to set.
+        """
+        self.user_message = message
+    
+    @rx.event
+    def set_chat_title(self, title: str):
+        """Set the title for a new chat.
+        
+        Args:
+            title: The title to set.
+        """
+        self.new_chat_name = title
+        
+    @rx.event
+    async def create_chat(self):
+        """Create a new chat session."""
+        async with self:
+            # Create new session
+            session = ChatSession(id=str(uuid4()), name=self.new_chat_name if self.new_chat_name else "Untitled")
+            self.chat_sessions[session.id] = session
+            self.current_chat_id = session.id
+            
+            # Reset UI state
+            self.new_chat_name = ""
+            self.show_modal = False
+    
+    @rx.event
+    async def delete_chat(self, chat_id: str):
+        """Delete a chat session.
+        
+        Args:
+            chat_id: The ID of the chat session to delete.
+        """
+        logger.debug(f"Deleting chat: {chat_id}")
+        
+        # Find the chat session
+        chat_session = next((s for s in self.chat_sessions if s.id == chat_id), None)
+        if not chat_session:
+            logger.error(f"Chat session not found: {chat_id}")
+            
+        # Gracefully terminate any ongoing chat in the session being deleted
+        logger.debug(f"Gracefully terminating chat in session being deleted: {chat_id}")
+        # Use the token manager to terminate the session
+        token_manager.terminate_session(chat_id)
+        # Also cancel immediately if needed
+        token_manager.cancel_session(chat_id)
+        
+        # Clean up tokens from the manager
+        token_manager.remove_termination_condition(chat_id)
+        token_manager.remove_cancellation_token(chat_id)
+            
+        # Remove from list
+        self.chat_sessions = [s for s in self.chat_sessions if s.id != chat_id]
+        
+        # If this was the current chat, switch to another one or clear
+        if self.current_chat_id == chat_id:
+            if self.chat_sessions:
+                self.current_chat_id = self.chat_sessions[0].id
+            else:
+                self.current_chat_id = None
+                
+        logger.debug(f"Deleted chat: {chat_id}")
+    
+    @rx.event
+    def toggle_modal(self):
+        """Toggle the new chat modal."""
+        self.show_modal = not self.show_modal
+        if self.show_modal:
+            self.new_chat_name = ""
+            
+    @rx.event
+    def open_modal(self):
+        """Open the new chat modal."""
+        self.show_modal = True
+        self.new_chat_name = ""
+        
+    @rx.event
+    def close_modal(self):
+        """Close the new chat modal."""
+        self.show_modal = False
+        
+    @rx.event
+    def check_and_open_modal(self):
+        """Check if we need to open the modal and open it if needed."""
+        # If there are no chat sessions or no current chat, open the modal
+        if not self.chat_sessions or not self.current_chat_id:
+            self.open_modal()
+    
+    @rx.event
+    async def switch_chat(self, chat_id: str):
+        """Switch to a different chat session.
+        
+        Args:
+            chat_id: The ID of the chat session to switch to.
+        """
+        logger.debug(f"Switching to chat: {chat_id}")
+        # Do nothing if the chat_id is the same as the current chat_id
+        if chat_id == self.current_chat_id:
+            return
+        # Gracefully terminate any ongoing chat in the current session
+        if self.current_session:
+            logger.debug(f"Gracefully terminating ongoing chat in session: {self.current_session.id}")
+            # Use the token manager to terminate the session
+            token_manager.terminate_session(self.current_session.id)
+            # Also cancel immediately if needed
+            token_manager.cancel_session(self.current_session.id)
+
+        # Set as current chat
+        self.current_chat_id = chat_id
+        logger.debug(f"Switched to chat: {chat_id}")
+    
     async def get_team(self) -> RoundRobinGroupChat:
-        """Get or create the team of agents."""
+        """Get or create the team of agents for the current session."""
+        if not self.current_session:
+            logger.error("No current session available")
+            raise ValueError("No current session available")
+            
+        # Create external termination condition that can be triggered from outside
         termination = ExternalTermination()
-        async def get_user_input(prompt: str, cancellation_token: Optional[CancellationToken] = None) -> str:
+        
+        # Store the termination condition in the token manager
+        token_manager.store_termination_condition(self.current_session.id, termination)
+        
+        async def get_user_input(prompt: str, cancellation_token=None) -> str:
             """Get input from the user through the UI.
             
             Args:
                 prompt: The prompt to show to the user.
-                cancellation_token: Optional token to cancel the operation.
+                cancellation_token: Ignored parameter, we use ExternalTermination instead.
             
             Returns:
                 The user's input.
             """
             logger.debug(f"Getting user input with prompt: {prompt}")
             
-            async with self:
-                # Enable input and show prompt
-                self.processing = False
-                logger.debug("Input enabled, waiting for message")
+            if not self.current_session:
+                logger.error("No current session available in get_user_input")
+                raise ValueError("No current session available")
+            logger.debug("Input enabled, waiting for message")
             
             try:
                 while True:
-                    # Wait for a message from the queue
-                    logger.debug("Waiting for message from queue")
+                    # Wait for a message from the current session
+                    logger.debug("Waiting for message from current session")
                     message = None
-                    if self.submitted_message:
-                        message = self.submitted_message
+                    
+                    if self.current_session and self.current_session.submitted_message:
+                        message = self.current_session.submitted_message
                         async with self:
-                            self.submitted_message = None
+                            self.current_session.submitted_message = None
+                            self.current_session.is_processing = True
+                    
                     if message:  # Only return non-empty messages
                         logger.debug(f"Got valid user input: {message}")
-                        async with self:
-                            self.processing = True
                         return message
+                        
+                    # Check if the external termination was triggered
+                    # Get the termination condition from the token manager
+                    current_termination = token_manager.get_termination_condition(self.current_session.id)
+                    if current_termination and current_termination.terminated:
+                        logger.debug("Input cancelled due to session termination")
+                        raise asyncio.CancelledError("Session terminated")
+                        
                     await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"Error getting user input: {str(e)}")
@@ -122,118 +348,164 @@ class ChatState(rx.State):
         # Create the team
         team = RoundRobinGroupChat([assistant, yoda, user_proxy], termination_condition=termination)
         
-        # Load state if exists
-        if self.team_state:
-            await team.load_state(self.team_state)
-        elif os.path.exists(STATE_PATH):
-            async with aiofiles.open(STATE_PATH, "r") as file:
-                state = json.loads(await file.read())
-                await team.load_state(state)
-                self.team_state = state
+        # Load state from current session if exists
+        if self.current_session and self.current_session.team_state:
+            logger.debug(f"Loading team state from session {self.current_session.id}")
+            await team.load_state(self.current_session.team_state)
                 
-        # Load history if exists
-        if not self.messages and os.path.exists(HISTORY_PATH):
-            async with aiofiles.open(HISTORY_PATH, "r") as file:
-                history = json.loads(await file.read())
-                self.messages = [QA(**msg) for msg in history]
+        # No need to load history as it's already in the session
                 
         return team, termination
 
+    @rx.event
     def on_message_input(self, value: str):
         """Handle message input changes.
         
         Args:
             value: The new message value.
         """
-        self.current_message = value
+        self.user_message = value
     
     @rx.event
-    def submit_message(self):
+    def handle_message_submit(self):
+        """Handle message submission based on session state."""
+        if not self.current_session:
+            return
+            
+        # Don't process empty messages
+        if not self.user_message.strip() and self.current_session.is_initialized:
+            return
+            
+        logger.debug(f"Handling message submit: {self.user_message}")
+        
+        # Decide whether to start a new chat or submit a message to existing chat
+        if not self.current_session.is_initialized:
+            # Start a new chat
+            logger.debug("Starting new chat")
+            return ChatState.start_chat
+        else:
+            # Submit message to existing chat
+            logger.debug("Submitting message to existing chat")
+            return ChatState.submit_message
+    
+    @rx.event
+    async def submit_message(self):
         """Submit a message to the team."""
-        self.submitted_message = self.current_message
-        self.current_message = ""
+        if not self.current_session:
+            return
+            
+        # Don't send empty messages
+        if not self.user_message.strip():
+            return
+            
+        logger.debug(f"Submitting message: {self.user_message}")
+        
+        # Store the message in the current session for get_user_input
+        self.current_session.submitted_message = self.user_message
+        
+        # Create and add user message to chat
+        user_message = Message(
+            source="user",
+            content=self.user_message,
+            type="TextMessage"
+        )
+        
+        # Add message to current session and clear input
+        await self.add_message_to_current_session(user_message)
+        self.user_message = ""
 
+    async def add_message_to_current_session(self, message: Message):
+        """Add a message to the current session using proper state update patterns.
+        
+        Args:
+            message: The message to add to the current session.
+        """
+        if not self.current_session:
+            logger.error("Cannot add message: No current session available")
+            return
+            
+        # Create a new list with the new message to ensure Reflex detects the change
+        updated_messages = self.current_session.messages + [message]
+        # Assign the new list back to trigger proper UI updates
+        self.current_session.messages = updated_messages
+        logger.debug(f"Added message from {message.source}: {message.content[:30]}...")
+    
     @rx.event(background=True)
     async def start_chat(self):
-        """Send a message to the team."""
-        logger.debug("Starting send_message")
+        """Start a new chat with the AI team."""
+        logger.debug("Starting new chat")
         
-        # Put message in queue for get_user_input
+        if not self.current_session:
+            logger.error("No current session available")
+            return
+            
+        # Mark session as initialized and processing
         async with self:
-            # Set processing flag
-            self.processing = True
-            # Add user message to chat
-            user_message = QA(content="Let's talk about sci-fi movies", source="admin")
-            logger.debug(f"Added user message: {user_message}")
+            self.current_session.is_initialized = True
+            self.current_session.is_processing = True
         
         try:
-            # Save history
-            async with aiofiles.open(HISTORY_PATH, "w") as file:
-                await file.write(json.dumps([msg.dict() for msg in self.messages]))
-                logger.debug("Saved chat history")
-                
-            # Get team and process message
+            # Get team instance
             team, termination = await self.get_team()
-            logger.debug("Got team instance")
+            logger.debug("Team initialized successfully")
             
-            # Create message for the team
-            request = TextMessage(content=self.current_message, source="user")
-            stream = team.run_stream(task=request)
+            # Create initial message for the team using the user's input or a default
+            initial_content = self.user_message.strip() if self.user_message.strip() else "Let's start a conversation"
+            request = TextMessage(content=initial_content, source="user")
+            
+            # Create a cancellation token for immediate cancellation if needed
+            cancellation_token = CancellationToken()
+            # Store it in the token manager
+            token_manager.store_cancellation_token(self.current_session.id, cancellation_token)
+            
+            # Use both the termination condition (via team config) and cancellation token
+            stream = team.run_stream(task=request, cancellation_token=cancellation_token)
             
             async for message in stream:
+                logger.debug(f"Got message: {message}")
                 if isinstance(message, TaskResult):
                     logger.debug("Skipping TaskResult message")
                     continue
-                
-                logger.debug(f"Got message: {message}")
-                
                 if isinstance(message, UserInputRequestedEvent):
                     logger.debug("Waiting for user input")
                     # Enable input and wait
                     async with self:
-                        self.processing = False
-                    # The get_user_input function will be called by the UserProxyAgent
+                        self.current_session.is_processing = False
                     continue
                     
-                async with self:
-                    agent_message = QA(content=message.content, source=message.source)
-                    self.messages.append(agent_message)
-                    logger.debug(f"Added agent message: {agent_message}")
+                # Extract content and source from the message
+                content = getattr(message, 'content', str(message))
+                source = getattr(message, 'source', 'system')
                 
-                # Save history
-                async with aiofiles.open(HISTORY_PATH, "w") as file:
-                    await file.write(json.dumps([msg.dict() for msg in self.messages]))
-                    logger.debug("Saved updated chat history")
+                # Add to current session
+                async with self:
+                    await self.add_message_to_current_session(Message(content=content, source=source, type="TextMessage"))
             
             # Save team state
             state = await team.save_state()
             termination.cancel()
             logger.debug("Got team state")
             
+            # Store the state in the session
             async with self:
-                self.team_state = state
-            
-            async with aiofiles.open(STATE_PATH, "w") as file:
-                await file.write(json.dumps(self.team_state))
-                logger.debug("Saved team state to file")
+                self.current_session.team_state = state
                 
         except Exception as e:
-            logger.error(f"Error in send_message: {str(e)}")
+            logger.error(f"Error starting chat: {str(e)}")
             async with self:
                 # Add error message to chat
-                error_message = QA(
-                    content=f"An error occurred: {str(e)}",
-                    source="system"
-                )
-                self.messages.append(error_message)
-            
-        finally:
-            async with self:
-                # Reset processing flag if not waiting for input
-                # if not any(isinstance(msg, UserInputRequestedEvent) for msg in self.messages):
-                self.processing = False
+                error_message = Message(content=f"Failed to initialize chat: {str(e)}", source="system", type="TextMessage")
+                await self.add_message_to_current_session(error_message)
+                self.current_session.is_processing = False
                 
-            logger.debug("Finished send_message")
+        finally:
+            # Reset processing flag
+            async with self:
+                self.current_session.is_processing = False
+                
+        logger.debug("Chat initialization completed")
+    
+
 
     @rx.event(background=True)
     async def scroll_to_bottom(self):
