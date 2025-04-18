@@ -1,3 +1,7 @@
+model_config.yaml
+!model_config.template.yaml
+.env
+!.env.template
 .states
 *.py[cod]
 __pycache__/
