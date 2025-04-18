@@ -3,8 +3,10 @@ import reflex_chakra as rc
 import logging
 
 from reflex_chat.components import loading_icon
-from reflex_chat.states.chat_state import ChatState, Message
+from reflex_chat.states.chat_state import ChatState, Message, Participant
+from reflex_chat.components.transcribe import transcribe_button
 
+from reflex_chat.config import BOTTOM_ELEMENT_ID
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,7 @@ def message(msg: Message) -> rx.Component:
             "align": "right",
             "avatar": "👤"
         },
-        "assistant": {
+        "participant": {
             "bg_color": "violet",
             "text_color": "violet",
             "align": "left",
@@ -44,12 +46,6 @@ def message(msg: Message) -> rx.Component:
             "text_color": "blue",
             "align": "left",
             "avatar": "ℹ️"
-        },
-        "yoda": {
-            "bg_color": "green",
-            "text_color": "green",
-            "align": "left",
-            "avatar": "🧙"
         },
         "admin": {
             "bg_color": "amber",
@@ -113,66 +109,136 @@ def message(msg: Message) -> rx.Component:
         padding_y="0.5em",
     )
 
-
-def chat() -> rx.Component:
-    """The main chat component."""
+def chat_messages() -> rx.Component:
     return rx.vstack(
-        rx.box(
+        rx.cond(
+            ChatState.current_session,
             rx.cond(
-                ChatState.current_session,  # First check if we have a session
-                rx.cond(
-                    ChatState.has_messages,  # Then check if there are messages
-                    rx.foreach(
-                        ChatState.messages,
-                        message
-                    ),
-                    # Show welcome message if no messages
-                    rx.center(
-                        rx.vstack(
-                            rx.heading("Welcome to Multi-Agent Chat"),
-                            rx.text("Type a message below to start chatting with AI agents."),
-                            padding="2em",
-                            spacing="4",
-                            text_align="center",
-                            color=rx.color("mauve", 11),
-                        ),
-                        height="100%",
-                    )
-                ),
-                # No session available
+                ChatState.has_messages,  # Then check if there are messages
+                rx.foreach(ChatState.messages, message),
+                # Show welcome message if no messages
                 rx.center(
                     rx.vstack(
-                        rx.heading("No Chat Session"),
-                        rx.text("Create a new chat to get started."),
+                        rx.heading("Welcome to Multi-Agent Chat"),
+                        rx.text("Type a message below to start chatting with AI agents."),
                         padding="2em",
                         spacing="4",
                         text_align="center",
                         color=rx.color("mauve", 11),
                     ),
                     height="100%",
-                )
+                ),
+            ),
+            # No session available
+            rx.center(
+                rx.vstack(
+                    rx.heading("No Chat Session"),
+                    rx.text("Create a new chat to get started."),
+                    padding="2em",
+                    spacing="4",
+                    text_align="center",
+                    color=rx.color("mauve", 11),
+                ),
+                height="100%",
+            ),
+        ),
+        rx.el.div(id=BOTTOM_ELEMENT_ID, style={"height": "1px"}),  # Hidden anchor
+    )
+
+def chat_stats_bar() -> rx.Component:
+    def render_participant(participant: rx.Var[Participant]) -> rx.Component:
+        return rx.badge(
+            participant.name,
+            color_scheme=participant.color,
+            margin_right="1",
+            variant="soft",
+        )
+    return rx.vstack(
+        rx.hstack(
+            rx.hstack(
+                rx.icon("circle", size=18, color=rx.color("mauve", 10)),
+                rx.text("Topic:", size="2", color=rx.color("mauve", 10)),
+                rx.text(
+                    ChatState.initial_chat_message,
+                    font_style="italic",
+                    color=rx.color("mauve", 11),
+                    overflow="hidden",
+                    text_overflow="ellipsis",
+                    white_space="nowrap",
+                ),
+                spacing="2",
+                align_items="center",
+                flex_grow=1,
+                min_width="0",
             ),
             width="100%",
-            overflow_y="auto",  # Enable vertical scrolling
-            id="chat-container", # Add an ID to reference
-            min_height="300px",
-            height="100%",
+            justify_content="space-between",
+            background_color=rx.color("mauve", 2),
+            border_radius="md",
+            border=f"1px solid {rx.color('mauve', 4)}",
+            box_shadow="sm",
+            align_items="center",
         ),
-        py="8",
-        flex="1", 
+        rx.hstack(
+            rx.hstack(
+                rx.icon("message_circle", size=18, color=rx.color("violet", 9)),
+                rx.text(f"Messages: {ChatState.message_count}", size="2", color=rx.color("mauve", 10)),
+                spacing="2",
+                align_items="center",
+            ),
+            rx.divider(orientation="vertical", height="28px", margin_x="3"),
+            rx.hstack(
+                rx.icon("users", size=18, color=rx.color("mauve", 10)),
+                rx.text("Participants:", size="2", color=rx.color("mauve", 10)),
+                rx.foreach(
+                    ChatState.chat_participants, render_participant
+                ),
+                spacing="2",
+                align_items="center",
+                flex_wrap="wrap",
+            ),
+            width="100%",
+            justify_content="space-between",
+            padding_y="2",
+            padding_x="4",
+            background_color=rx.color("mauve", 2),
+            border_radius="md",
+            border=f"1px solid {rx.color('mauve', 4)}",
+            box_shadow="sm",
+            gap="2",
+            align_items="center",  # <--- Add this
+        ),
         width="100%",
-        max_width="50em",
+        padding_x="2",
+        padding_y="2",
+        spacing="3",
+        gap="2",
+        align_items="center",  # <--- Add this to vstack
+    )
+
+
+def chat() -> rx.Component:
+    """The main chat component."""
+    return rx.box(
+        rx.vstack(
+            chat_stats_bar(), 
+            chat_messages(),
+            justify_content="center",
+            on_mount=ChatState.scroll_to_bottom,  # Add scroll on mount
+        ),  # Centered stats bar
+        flex="1",
+        min_height="0",
+        width="100%",
+        id="chat-container",
+        margin = "2em",
         padding_x="4px",
         align_self="center",
-        overflow="hidden",
-        padding_bottom="5em",
-        on_mount=ChatState.scroll_to_bottom,  # Add scroll on mount
     )
 
 
 def action_bar() -> rx.Component:
     """The action bar to send a new message."""
-    return rx.center(
+    return rx.box(
         rx.vstack(
             rc.form(
                 rc.form_control(
@@ -190,15 +256,19 @@ def action_bar() -> rx.Component:
                             on_change=ChatState.set_user_message,
                             width=["15em", "20em", "45em", "50em", "50em", "50em"],
                         ),
-                        rx.button(
-                            rx.cond(
-                                ChatState.current_session.is_processing,
-                                loading_icon(height="1em"),
-                                rx.text(ChatState.submit_button_text),
+                        rx.hstack(
+                            rx.button(
+                                rx.cond(
+                                    ChatState.is_processing,
+                                    loading_icon(height="1em"),
+                                    rx.text(ChatState.submit_button_text),
+                                ),
+                                type="submit",
+                                color_scheme=ChatState.submit_button_color,
+                                is_disabled=~ChatState.can_send_message,
                             ),
-                            type="submit",
-                            color_scheme=ChatState.submit_button_color,
-                            is_disabled=~ChatState.can_send_message,
+                            transcribe_button(),
+                            spacing="2",
                         ),
                         align_items="center",
                     ),
@@ -207,18 +277,19 @@ def action_bar() -> rx.Component:
                 on_submit=ChatState.handle_message_submit,
                 reset_on_submit=False,
             ),
-            rx.text(
-                "AI assistants may return factually incorrect or misleading responses. Use discretion.",
-                text_align="center",
-                font_size=".75em",
-                color=rx.color("mauve", 10),
+            rx.input(
+                value=ChatState.scroll_flag,
+                display="none",
+                on_change=ChatState.scroll_to_bottom,
             ),
             align_items="center",
         ),
         position="sticky",
         bottom="0",
         left="0",
-        padding_y="16px",
+        z_index="10",
+        padding_y="2em",
+        padding_x="2em",
         backdrop_filter="auto",
         backdrop_blur="lg",
         border_top=f"1px solid {rx.color('mauve', 3)}",
